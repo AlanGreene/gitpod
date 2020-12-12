@@ -4,6 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
+import * as url from 'url';
 import { injectable, inject } from 'inversify';
 import { ResolvePluginsParams, ResolvedPlugins, TheiaPlugin, PreparePluginUploadParams, InstallPluginsParams, UninstallPluginParams, ResolvedPluginKind } from '@gitpod/gitpod-protocol';
 import { TheiaPluginDB } from "@gitpod/gitpod-db/lib/theia-plugin-db";
@@ -15,6 +16,7 @@ import { ErrorCodes } from '@gitpod/gitpod-protocol/lib/messaging/error';
 import { PluginIndexEntry } from '@gitpod/gitpod-protocol/lib/theia-plugins';
 import { StorageClient } from '../storage/storage-client';
 import { UserStorageResourcesDB } from '@gitpod/gitpod-db/lib/user-storage-resources-db';
+import fetch from 'node-fetch';
 
 const builtinExtensions: PluginIndexEntry[] = require('@gitpod/gitpod-protocol/data/builtin-theia-plugins.json');
 
@@ -40,7 +42,7 @@ export class TheiaPluginService {
         if (bucketNameOverride) {
             return bucketNameOverride;
         }
-        
+
         const hostDenominator = this.env.hostUrl.url.hostname.replace(/\./g, '--');
         return `gitpod-${hostDenominator}-plugins`;
     }
@@ -121,20 +123,24 @@ export class TheiaPluginService {
         return this.getPublicPluginURL(pluginEntryId);
     }
 
-    protected toSimplePluginName(fullPluginName: string) {
+    private parseFulllPluginName(fullPluginName: string): { name: string, version?: string } {
         const idx = fullPluginName.lastIndexOf('@');
         if (idx === -1) {
-            return fullPluginName;
+            return {
+                name: fullPluginName
+            };
         }
-        return fullPluginName.substring(0, idx);
+        const name = fullPluginName.substring(0, idx);
+        const version = fullPluginName.substr(idx + 1);
+        return { name, version };
     }
 
     protected toPluginId(fullPluginName: string, hash: string) {
         return `${fullPluginName}:${hash}`;
     }
 
-    protected toFullPluginName(pluginId: string) {
-        return pluginId.substring(0, pluginId.lastIndexOf(":")) || pluginId;
+    protected toFullPluginName(pluginId: string): string {
+        return (pluginId.substring(0, pluginId.lastIndexOf(":")) || pluginId).toLowerCase();
     }
 
     protected getPublicPluginURL(pluginEntryId: string) {
@@ -145,17 +151,22 @@ export class TheiaPluginService {
             }).toString();
     }
 
-    async resolvePlugins(userId: string, { config, builtins }: ResolvePluginsParams): Promise<ResolvedPlugins> {
+    async resolvePlugins(userId: string, { config, builtins, vsxRegistryUrl }: ResolvePluginsParams): Promise<ResolvedPlugins> {
         const resolved: ResolvedPlugins = {};
         const addedPlugins = new Set<string>();
         const resolvePlugin = async (extension: string, kind: ResolvedPluginKind) => {
             const pluginId = extension.trim();
-            const simplePluginName = this.toSimplePluginName(pluginId);
-            if (!(addedPlugins.has(simplePluginName))) {
-                addedPlugins.add(simplePluginName);
-                const url = kind === 'builtin' ? 'local' : await this.getPluginURL(pluginId);
-                const fullPluginName = this.toFullPluginName(pluginId);
-                resolved[pluginId] = url && { fullPluginName, url, kind } || undefined;
+            const parsed = this.parseFulllPluginName(pluginId);
+            if (!(addedPlugins.has(parsed.name))) {
+                addedPlugins.add(parsed.name);
+                let resolvedPlugin: { url: string, fullPluginName: string } | undefined;
+                if (kind === 'builtin') {
+                    resolvedPlugin = { fullPluginName: this.toFullPluginName(pluginId), url: 'local' }
+                } else {
+                    resolvedPlugin = await this.resolveFromUploaded(pluginId)
+                        || await this.resovleFromOpenVSX(parsed, vsxRegistryUrl);
+                }
+                resolved[pluginId] = resolvedPlugin && Object.assign(resolvedPlugin, { kind }) || undefined;
             }
         }
         const workspaceExtensions = config && config.vscode && config.vscode.extensions || [];
@@ -180,18 +191,70 @@ export class TheiaPluginService {
         return resolved;
     }
 
-    protected async getPluginURL(pluginId: string): Promise<string | undefined> {
+    private async resolveFromUploaded(pluginId: string): Promise<{
+        url: string
+        fullPluginName: string
+    } | undefined> {
         const pluginEntries = await this.pluginDB.findByPluginId(pluginId);
         const uploadedPlugins = pluginEntries.filter(e => e.state == TheiaPlugin.State.Uploaded);
         if (uploadedPlugins.length < 1) {
-            log.debug(`No uploaded plugin with id "${pluginId}" found.`);
+            log.debug(`No uploaded plugin with id "${pluginId}" found`);
             return undefined;
         }
         if (uploadedPlugins.length > 1) {
             log.debug(`Many plugins with same ID" found. Taking first!`, { count: uploadedPlugins.length, pluginId });
         }
         const pluginEntry = uploadedPlugins[0];
-        return this.getPublicPluginURL(pluginEntry.id)
+        return {
+            fullPluginName: this.toFullPluginName(pluginId),
+            url: this.getPublicPluginURL(pluginEntry.id)
+        };
+    }
+
+    private async resovleFromOpenVSX({ name, version }: { name: string, version?: string }, vsxRegistryUrl = 'https://open-vsx.org'): Promise<{
+        url: string
+        fullPluginName: string
+    } | undefined> {
+        try {
+            const queryUrl = url.parse(vsxRegistryUrl);
+            queryUrl.pathname = '/api/-/query';
+            const queryHref = url.format(queryUrl)
+            const response = await fetch(queryHref, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify({
+                    extensionId: name,
+                    extensionVersion: version
+                })
+            });
+            if (response.status !== 200) {
+                log.error(`Failed to find extension '${name}@${version || 'latest'}' with '${queryHref}': ${response.statusText} (${response.status}).`);
+                return undefined;
+            }
+            const result: {
+                extensions: [{
+                    namespace: string
+                    name: string
+                    version: string
+                    files: { download: string }
+                } | undefined]
+            } = await response.json();
+            const extension = result.extensions[0];
+            if (!extension) {
+                log.debug(`Extension '${name}@${version || 'latest'}' not found in '${vsxRegistryUrl}' registry.`);
+                return undefined;
+            }
+            return {
+                fullPluginName: `${extension.namespace}.${extension.name}@${extension.version}`.toLowerCase(),
+                url: extension.files.download,
+            };
+        } catch (e) {
+            log.error(`Failed to find extension '${name}@${version || 'latest'}' in '${vsxRegistryUrl}' registry:`, e);
+            return undefined;
+        }
     }
 
     async installUserPlugins(userId: string, params: InstallPluginsParams): Promise<boolean> {
