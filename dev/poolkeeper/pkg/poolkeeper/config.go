@@ -22,6 +22,9 @@ type Task struct {
 
 	// PatchDeploymentAffinity patches all deployment's nodeAffinity from a certain namespace
 	PatchDeploymentAffinity *PatchDeploymentAffinity `json:"patchDeploymentAffinity,omitempty"`
+
+	// KeepNodeAlive blocks downscaling for a specified node
+	KeepNodeAlive *KeepNodeAlive `json:"keepNodeAlive,omitempty"`
 }
 
 // TODO Needs a lease: https://carlosbecker.com/posts/k8s-leader-election

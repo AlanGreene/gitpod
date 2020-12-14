@@ -6,6 +6,7 @@ package poolkeeper
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	// corev1 "k8s.io/api/core/v1"
@@ -47,11 +48,13 @@ func (pk *PoolKeeper) Start() {
 		go func(ctx context.Context, task *Task) {
 			ticker := time.NewTicker(time.Duration(task.Interval))
 			for {
+				log.WithField("task", task.Name).Infof("running task...")
 				if task.PatchDeploymentAffinity != nil {
-					log.WithField("task", task.Name).Infof("start patching deployments...")
 					task.PatchDeploymentAffinity.run(pk.Clientset)
-					log.WithField("task", task.Name).Infof("done patching deployments.")
+				} else if task.KeepNodeAlive != nil {
+					task.KeepNodeAlive.run(pk.Clientset, time.Now())
 				}
+				log.WithField("task", task.Name).Infof("task done.")
 
 				select {
 				case <-ctx.Done():
@@ -72,4 +75,18 @@ func (pk *PoolKeeper) Start() {
 func (pk *PoolKeeper) Stop() {
 	pk.stop <- struct{}{}
 	<-pk.done
+}
+
+// TimeOfDay is a time during the day. It unmarshals from JSON as hh:mm:ss string.
+type TimeOfDay time.Time
+
+// UnmarshalJSON unmarshales a time of day
+func (t *TimeOfDay) UnmarshalJSON(data []byte) error {
+	input := strings.Trim(string(data), "\"")
+	res, err := time.Parse("15:04:05", input)
+	if err != nil {
+		return err
+	}
+	*t = TimeOfDay(res)
+	return nil
 }

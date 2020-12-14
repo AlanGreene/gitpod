@@ -23,6 +23,18 @@
             }
           }
         }
+      },
+      {
+        "name": "keepBuildNodeAlive",
+        "interval": "5m",
+        "keepNodeAlive": {
+          "namespace": "default",
+          "nodeSelector": {
+            "dev/workload": "builds"
+          },
+          "periodStart": "08:00:00",
+          "periodEnd": "08:10:00"
+        }
       }
     ]
   }
